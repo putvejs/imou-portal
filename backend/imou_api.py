@@ -163,17 +163,16 @@ class ImouAPI:
 
     def get_device_status(self, device_id: str) -> str:
         """
-        Check if a Device Access Service device is online by attempting a snapshot.
+        Check if a Device Access Service device is online.
+        Uses deviceOnlineStatus (free, doesn't count against snapshot quota).
         Returns 'online' or 'offline'.
-        This is the only reliable status check for Device Access Service mode.
         """
         try:
-            self._ensure_token()
-            result = self._post_auth("setDeviceSnapEnhanced", {
-                "deviceId": device_id,
-                "channelId": "0",
-            })
-            return "online" if result.get("url") else "offline"
+            result = self.get_device_online_status([device_id])
+            device_list = result.get("deviceList", [])
+            if device_list:
+                return "online" if device_list[0].get("onLine") == 1 else "offline"
+            return "offline"
         except Exception:
             return "offline"
 

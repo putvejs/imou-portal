@@ -551,9 +551,8 @@ function ManualDeviceManager() {
 function SettingsModal({ onClose, user }) {
   const [settings, setSettings] = useState({
     webhook_url: '',
-    snapshot_interval: '300',
+    snapshot_interval: '900',
     notification_sound: '1',
-    auto_refresh_devices: '30',
   });
   const [users, setUsers]     = useState([]);
   const [newUser, setNewUser] = useState({ username: '', password: '', is_admin: false });
@@ -633,18 +632,21 @@ function SettingsModal({ onClose, user }) {
             <div className="settings-section">
               <div className="settings-section-title">Display Settings</div>
               <div className="form-group">
-                <label className="form-label">Snapshot Refresh Interval (seconds)</label>
+                <label className="form-label">Snapshot Refresh Interval</label>
                 <select
                   className="form-select"
                   value={settings.snapshot_interval}
                   onChange={e => setSettings(s => ({ ...s, snapshot_interval: e.target.value }))}
                 >
-                  <option value="60">1 minute</option>
-                  <option value="120">2 minutes</option>
-                  <option value="300">5 minutes (recommended)</option>
-                  <option value="600">10 minutes</option>
-                  <option value="1800">30 minutes</option>
+                  <option value="300">5 minutes — max 2 cameras on free tier</option>
+                  <option value="600">10 minutes — max 3 cameras on free tier</option>
+                  <option value="900">15 minutes — up to 5 cameras ✓ (recommended)</option>
+                  <option value="1800">30 minutes — comfortable for any setup</option>
+                  <option value="3600">1 hour — minimum API usage</option>
                 </select>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+                  Free tier: 30,000 calls/month (~1,000/day). At 15 min × 5 cameras = 480 calls/day.
+                </div>
               </div>
               <div className="toggle-row">
                 <div>
@@ -814,7 +816,7 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
   const intervalRef             = useRef(null);
   const fetchingRef             = useRef(false);  // prevent concurrent fetches
 
-  const refreshInterval = parseInt(settings?.snapshot_interval || '5') * 1000;
+  const refreshInterval = parseInt(settings?.snapshot_interval || '900') * 1000;
   const rateLimitRef = useRef(0);  // epoch ms until which snapshots are paused
 
   async function fetchSnapshot() {
@@ -830,9 +832,10 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
         img.onload = () => { setSnapshot(url); setLastTs(new Date().toLocaleTimeString()); };
         img.src = url;
       } else if (r.status === 429 || r.error?.startsWith('rate_limited:')) {
-        const secs = parseInt((r.error || '').split(':')[1] || '600');
+        const secs = parseInt((r.error || '').split(':')[1] || '86400');
         rateLimitRef.current = Date.now() + secs * 1000;
-        setLastTs(`⏳ API limit — retry in ${Math.ceil(secs/60)}m`);
+        const waitStr = secs >= 3600 ? `${Math.ceil(secs/3600)}h` : `${Math.ceil(secs/60)}m`;
+        setLastTs(`⏳ Monthly quota hit — retry in ${waitStr}`);
       }
     } catch (e) { /* keep last snapshot */ }
     finally { fetchingRef.current = false; }

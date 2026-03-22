@@ -231,9 +231,11 @@ def device_detail(device_id):
 
 
 # Snapshot rate-limit state.
-# Imou allows ~1 snapshot/second per account (OP1013 = too many calls).
+# Imou free tier: 30,000 API calls/month → ~1,000/day budget.
+# OP1013 = monthly quota exhausted (not per-second limit).
 # We serialize all snapshot requests through a single lock with a minimum
 # 1.1-second gap between calls so concurrent camera cards never pile up.
+# At the default 15-min interval: 5 cameras × 96 calls/day = 480 calls/day ✓
 _snapshot_lock = threading.Lock()
 _snapshot_last_call = 0.0        # epoch seconds of last successful API call
 _SNAPSHOT_MIN_GAP = 1.1          # seconds between Imou snapshot calls
@@ -271,10 +273,11 @@ def device_snapshot(device_id):
             err = str(e)
             logger.error("snapshot failed for %s: %s", device_id, err)
             if "OP1013" in err:
-                # Daily quota exhausted — back off 1 hour; quota resets at midnight Beijing (18:00 Latvia)
-                _snapshot_blocked_until = time.time() + 3600
-                logger.warning("OP1013 daily quota hit — snapshots blocked for 1 hour")
-                return api_err("rate_limited:3600", 429)
+                # Monthly quota exhausted (30k/month free tier). Block for 24h.
+                # Monitor usage at: open.imoulife.com/consoleNew/resourceManage/myResource
+                _snapshot_blocked_until = time.time() + 86400
+                logger.warning("OP1013 monthly quota hit — snapshots blocked for 24h. Check usage at open.imoulife.com/consoleNew/resourceManage/myResource")
+                return api_err("rate_limited:86400", 429)
             return api_err(err)
 
 
@@ -667,9 +670,8 @@ def serve_alarm_image(alarm_id):
 def get_settings():
     settings = {
         "webhook_url": db.get_setting("webhook_url", ""),
-        "snapshot_interval": db.get_setting("snapshot_interval", "300"),
+        "snapshot_interval": db.get_setting("snapshot_interval", "900"),
         "notification_sound": db.get_setting("notification_sound", "1"),
-        "auto_refresh_devices": db.get_setting("auto_refresh_devices", "30"),
         "imou_region": db.get_setting("imou_region", "default"),
     }
     return api_ok(settings)
@@ -679,8 +681,7 @@ def get_settings():
 @login_required
 def update_settings():
     body = request.get_json() or {}
-    allowed_keys = {"webhook_url", "snapshot_interval", "notification_sound",
-                    "auto_refresh_devices", "imou_region"}
+    allowed_keys = {"webhook_url", "snapshot_interval", "notification_sound", "imou_region"}
     for key, value in body.items():
         if key in allowed_keys:
             db.set_setting(key, str(value))
