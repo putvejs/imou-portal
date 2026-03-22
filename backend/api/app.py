@@ -750,6 +750,28 @@ def admin_delete_user(user_id):
     return api_ok()
 
 
+@app.route("/api/change-password", methods=["POST"])
+@login_required
+def change_password():
+    """Allow any logged-in user to change their own password."""
+    body = request.get_json() or {}
+    current = body.get("current_password", "")
+    new_pw  = body.get("new_password", "")
+
+    if not current or not new_pw:
+        return api_err("All fields are required")
+    if len(new_pw) < 8:
+        return api_err("New password must be at least 8 characters")
+
+    user = db.get_user_by_id(session["user_id"])
+    if not check_password_hash(user["password_hash"], current):
+        return api_err("Current password is incorrect")
+
+    db.update_user_password(session["user_id"], generate_password_hash(new_pw))
+    logger.info("User %s changed their password", user["username"])
+    return api_ok()
+
+
 # ─────────────────── Token status ────────────────────────────────────────────
 
 @app.route("/api/token-status")

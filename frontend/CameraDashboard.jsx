@@ -554,6 +554,8 @@ function SettingsModal({ onClose, user }) {
     snapshot_interval: '900',
     notification_sound: '1',
   });
+  const [pwForm, setPwForm]     = useState({ current: '', new: '', confirm: '' });
+  const [pwStatus, setPwStatus] = useState(null);
   const [users, setUsers]     = useState([]);
   const [newUser, setNewUser] = useState({ username: '', password: '', is_admin: false });
   const [saving, setSaving]   = useState(false);
@@ -568,6 +570,26 @@ function SettingsModal({ onClose, user }) {
       get('/admin/users').then(r => r.ok && setUsers(r.data));
     }
   }, []);
+
+  async function changePassword() {
+    setPwStatus(null);
+    if (!pwForm.current || !pwForm.new || !pwForm.confirm) {
+      return setPwStatus({ ok: false, msg: 'All fields are required' });
+    }
+    if (pwForm.new !== pwForm.confirm) {
+      return setPwStatus({ ok: false, msg: 'New passwords do not match' });
+    }
+    if (pwForm.new.length < 8) {
+      return setPwStatus({ ok: false, msg: 'Password must be at least 8 characters' });
+    }
+    const r = await post('/change-password', { current_password: pwForm.current, new_password: pwForm.new });
+    if (r.ok) {
+      setPwForm({ current: '', new: '', confirm: '' });
+      setPwStatus({ ok: true, msg: 'Password changed successfully!' });
+    } else {
+      setPwStatus({ ok: false, msg: r.error });
+    }
+  }
 
   async function saveSettings() {
     setSaving(true);
@@ -658,6 +680,30 @@ function SettingsModal({ onClose, user }) {
                   onClick={() => setSettings(s => ({ ...s, notification_sound: s.notification_sound === '1' ? '0' : '1' }))}
                 />
               </div>
+            </div>
+            <div className="settings-section">
+              <div className="settings-section-title">Change Password</div>
+              <div className="form-group">
+                <label className="form-label">Current Password</label>
+                <input className="form-input" type="password" value={pwForm.current}
+                  onChange={e => setPwForm(f => ({ ...f, current: e.target.value }))} />
+              </div>
+              <div className="form-group">
+                <label className="form-label">New Password</label>
+                <input className="form-input" type="password" value={pwForm.new}
+                  onChange={e => setPwForm(f => ({ ...f, new: e.target.value }))} />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Confirm New Password</label>
+                <input className="form-input" type="password" value={pwForm.confirm}
+                  onChange={e => setPwForm(f => ({ ...f, confirm: e.target.value }))} />
+              </div>
+              {pwStatus && (
+                <div style={{ marginBottom: 8, fontSize: 13, color: pwStatus.ok ? 'var(--green)' : 'var(--red)' }}>
+                  {pwStatus.msg}
+                </div>
+              )}
+              <button className="btn btn-primary" onClick={changePassword}>Change Password</button>
             </div>
           </>
         )}
