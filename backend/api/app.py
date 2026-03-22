@@ -271,9 +271,10 @@ def device_snapshot(device_id):
             err = str(e)
             logger.error("snapshot failed for %s: %s", device_id, err)
             if "OP1013" in err:
-                # Back off 60 seconds (not 10 minutes) — faster recovery
-                _snapshot_blocked_until = time.time() + 60
-                return api_err("rate_limited:60", 429)
+                # Daily quota exhausted — back off 1 hour; quota resets at midnight Beijing (18:00 Latvia)
+                _snapshot_blocked_until = time.time() + 3600
+                logger.warning("OP1013 daily quota hit — snapshots blocked for 1 hour")
+                return api_err("rate_limited:3600", 429)
             return api_err(err)
 
 
@@ -666,7 +667,7 @@ def serve_alarm_image(alarm_id):
 def get_settings():
     settings = {
         "webhook_url": db.get_setting("webhook_url", ""),
-        "snapshot_interval": db.get_setting("snapshot_interval", "3"),
+        "snapshot_interval": db.get_setting("snapshot_interval", "300"),
         "notification_sound": db.get_setting("notification_sound", "1"),
         "auto_refresh_devices": db.get_setting("auto_refresh_devices", "30"),
         "imou_region": db.get_setting("imou_region", "default"),

@@ -551,7 +551,7 @@ function ManualDeviceManager() {
 function SettingsModal({ onClose, user }) {
   const [settings, setSettings] = useState({
     webhook_url: '',
-    snapshot_interval: '3',
+    snapshot_interval: '300',
     notification_sound: '1',
     auto_refresh_devices: '30',
   });
@@ -639,11 +639,11 @@ function SettingsModal({ onClose, user }) {
                   value={settings.snapshot_interval}
                   onChange={e => setSettings(s => ({ ...s, snapshot_interval: e.target.value }))}
                 >
-                  <option value="2">2 seconds (fastest)</option>
-                  <option value="3">3 seconds</option>
-                  <option value="5">5 seconds</option>
-                  <option value="10">10 seconds</option>
-                  <option value="30">30 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="120">2 minutes</option>
+                  <option value="300">5 minutes (recommended)</option>
+                  <option value="600">10 minutes</option>
+                  <option value="1800">30 minutes</option>
                 </select>
               </div>
               <div className="toggle-row">
