@@ -239,14 +239,14 @@ def setup_scheduler(api_client: ImouAPI) -> BackgroundScheduler:
         next_run_time=None,
     )
 
-    # Poll alarm history every 60 seconds for all manually-registered devices
+    # Poll alarm history every 60 seconds for all manually-registered devices.
+    # No next_run_time override — APScheduler will fire after the first 60s interval.
     scheduler.add_job(
         poll_alarms,
         "interval",
         seconds=60,
         args=[api_client],
         id="alarm_poll",
-        next_run_time=None,  # first run triggered manually after startup
     )
 
     return scheduler

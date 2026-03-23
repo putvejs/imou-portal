@@ -542,8 +542,8 @@ def sync_notifications():
 
     # Build time window: days back → now, formatted as Imou expects (ISO 8601 UTC)
     now = datetime.utcnow()
-    begin = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    end   = now.strftime("%Y-%m-%dT%H:%M:%S")
+    begin = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    end   = now.strftime("%Y-%m-%d %H:%M:%S")
 
     # Determine which devices to sync — use manually-registered devices from DB
     if target_device:
