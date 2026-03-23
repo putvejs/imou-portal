@@ -1067,7 +1067,7 @@ function App() {
   const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [layout, setLayout]         = useState('auto');
-  const [alertDayFilter, setAlertDayFilter] = useState(1);
+  const [alertDayFilter, setAlertDayFilter] = useState(7);
   const [toasts, setToasts]         = useState([]);
   const [selectedCamera, setSelectedCamera] = useState(null);
   const [ptzCamera, setPtzCamera]   = useState(null);
@@ -1085,7 +1085,7 @@ function App() {
         const [meRes, devsRes, notifsRes, settingsRes] = await Promise.all([
           get('/me'),
           get('/devices'),
-          get('/notifications?limit=50'),
+          get('/notifications?limit=200'),
           get('/settings'),
         ]);
 
@@ -1121,7 +1121,7 @@ function App() {
           const msg = JSON.parse(e.data);
           if (msg.type === 'notification') {
             const notif = msg.data;
-            setNotifications(prev => [notif, ...prev.slice(0, 99)]);
+            setNotifications(prev => [notif, ...prev.slice(0, 199)]);
             setUnreadCount(c => c + 1);
             addToast(notif);
             // Play sound if enabled
@@ -1282,7 +1282,7 @@ function App() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               {/* Alert day filter */}
               <div className="notif-filter-bar" style={{ padding: 0, margin: 0 }}>
-                {[['All', 0], ['Today', 1], ['2d', 2], ['3d', 3], ['4d', 4]].map(([label, val]) => (
+                {[['All', 0], ['Today', 1], ['3d', 3], ['7d', 7], ['14d', 14]].map(([label, val]) => (
                   <button key={val}
                     className={`notif-filter-btn${alertDayFilter === val ? ' active' : ''}`}
                     onClick={() => setAlertDayFilter(val)}>{label}</button>
