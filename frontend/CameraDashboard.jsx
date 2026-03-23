@@ -21,13 +21,20 @@ const del  = (path)       => api('DELETE', path);
 
 // ─────────────────── Utility helpers ─────────────────────────────────────────
 
+// alarm_time is stored as UTC (without Z). Add Z so JS parses it as UTC, not local.
+function toUtcDate(dateStr) {
+  if (!dateStr) return new Date(NaN);
+  const s = String(dateStr).replace(' ', 'T');
+  return new Date(s.endsWith('Z') || s.includes('+') ? s : s + 'Z');
+}
+
 function timeAgo(dateStr) {
   if (!dateStr) return '';
-  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
+  const diff = (Date.now() - toUtcDate(dateStr).getTime()) / 1000;
   if (diff < 60)   return 'just now';
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return new Date(dateStr).toLocaleDateString();
+  return toUtcDate(dateStr).toLocaleDateString('lv-LV', { timeZone: 'Europe/Riga' });
 }
 
 function eventLabel(type) {
@@ -1048,8 +1055,8 @@ function CameraAlerts({ deviceId, notifications, dayFilter, onMarkOne, onImageVi
             }}>
               {eventLabel(n.event_type)}
             </span>
-            <span className="cam-alert-time" title={n.alarm_time || n.created_at}>
-              {(n.alarm_time || n.created_at || '').replace('T', ' ').substring(11, 19)}
+            <span className="cam-alert-time" title={(n.alarm_time || n.created_at) + ' UTC'}>
+              {toUtcDate(n.alarm_time || n.created_at).toLocaleTimeString('lv-LV', { timeZone: 'Europe/Riga', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
               {' '}<span style={{opacity:0.5, fontSize:'0.85em'}}>{timeAgo(n.alarm_time || n.created_at)}</span>
             </span>
           </div>
