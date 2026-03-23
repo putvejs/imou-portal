@@ -547,13 +547,16 @@ def imou_webhook():
                       data.get("msgType") or "Unknown")
         alarm_time = data.get("alarmTime") or data.get("alarm_time") or datetime.utcnow().isoformat()
 
-        # Image URL may be a string or a list
+        # Image URL — Imou uses picurlArray (list) or thumbUrl (string)
+        # Also handle legacy field names from older firmware
         image_url = ""
-        raw_urls = data.get("imageUrls") or data.get("image_url") or data.get("imageUrl") or []
-        if isinstance(raw_urls, list) and raw_urls:
-            image_url = raw_urls[0]
-        elif isinstance(raw_urls, str):
-            image_url = raw_urls
+        pic_array = data.get("picurlArray") or data.get("imageUrls") or []
+        if isinstance(pic_array, list) and pic_array:
+            image_url = pic_array[0]
+        else:
+            raw = data.get("thumbUrl") or data.get("image_url") or data.get("imageUrl") or ""
+            if isinstance(raw, str):
+                image_url = raw
 
         if not device_id:
             return "ok", 200
