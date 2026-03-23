@@ -214,19 +214,35 @@ class ImouAPI:
         stream_id: 0 = main stream (HD), 1 = sub stream (SD)
         Returns normalised dict: {hls, liveToken, streams, ...}
         """
-        result = self._post_auth("bindDeviceLive", {
-            "deviceId": device_id,
-            "channelId": channel_id,
-            "streamId": stream_id,
-        })
+        try:
+            result = self._post_auth("bindDeviceLive", {
+                "deviceId": device_id,
+                "channelId": channel_id,
+                "streamId": stream_id,
+            })
+        except ImouAPIError as e:
+            if e.code == "LV1001":
+                # Stream already bound — fetch existing session instead of erroring
+                logger.info("LV1001 for %s — reusing existing live session", device_id)
+                result = self.get_live_stream_info(device_id, channel_id)
+            else:
+                raise
+
         # Normalise: extract HLS from streams array if present (Device Access Service format)
         streams = result.get("streams", [])
         if streams and isinstance(streams, list):
-            s = streams[0]
-            result["hls"]     = result.get("hls") or s.get("hls", "")
-            result["subHls"]  = result.get("subHls") or (streams[1].get("hls", "") if len(streams) > 1 else "")
-            result["flv"]     = result.get("flv") or s.get("flv", "")
-            result["rtmp"]    = result.get("rtmp") or s.get("rtmp", "")
+            # Find streams matching requested stream_id, prefer HTTPS
+            matching = [s for s in streams if s.get("streamId") == stream_id and "proto=https" in s.get("hls", "")]
+            if not matching:
+                matching = [s for s in streams if s.get("streamId") == stream_id]
+            if not matching:
+                matching = streams
+            s = matching[0]
+            alt = matching[1] if len(matching) > 1 else matching[0]
+            result["hls"]    = result.get("hls") or s.get("hls", "")
+            result["subHls"] = result.get("subHls") or alt.get("hls", "")
+            result["flv"]    = result.get("flv") or s.get("flv", "")
+            result["rtmp"]   = result.get("rtmp") or s.get("rtmp", "")
         return result
 
     def get_live_stream_info(self, device_id: str, channel_id: str = "0") -> dict:
