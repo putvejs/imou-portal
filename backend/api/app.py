@@ -9,6 +9,7 @@ Endpoints:
                  GET/POST /api/devices/<id>/nightvision, GET/POST /api/devices/<id>/privacy
   Notifications: GET /api/notifications, POST /api/notifications/read-all
                  POST /api/notifications/<id>/read, DELETE /api/notifications
+                 POST /api/notifications/sync — pull missed alarms from Imou cloud
   Webhook:       POST /api/webhook/imou
   SSE:           GET /api/sse
   Settings:      GET/POST /api/settings
@@ -518,6 +519,69 @@ def clear_notifications():
     days = int(request.args.get("older_than_days", 30))
     db.delete_notifications(days)
     return api_ok()
+
+
+@app.route("/api/notifications/sync", methods=["POST"])
+@login_required
+def sync_notifications():
+    """
+    Pull alarm history from Imou cloud for all devices (or a specific one)
+    and save any missing notifications into the local DB.
+
+    This recovers alerts that were missed by the webhook (e.g. while the app
+    was down, or when the Imou account quota was exhausted and the webhook
+    subscription lapsed).
+
+    Query params:
+      device_id — optional, sync only this device
+      days      — how many days back to look (default: 3, max: 7)
+    """
+    body = request.get_json() or {}
+    target_device = body.get("device_id")
+    days = min(int(body.get("days", 3)), 7)  # cap at 7 days to limit API calls
+
+    # Build time window: days back → now, formatted as Imou expects (ISO 8601 UTC)
+    now = datetime.utcnow()
+    begin = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    end   = now.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Determine which devices to sync
+    all_devices = imou.get_devices() if not target_device else None
+    device_ids = [target_device] if target_device else [d["deviceId"] for d in (all_devices or [])]
+
+    imported = 0
+    errors = []
+    for device_id in device_ids:
+        try:
+            result = imou.get_alarm_list(device_id, begin_time=begin, end_time=end, limit=50)
+            alarms = result.get("alarms") or result.get("list") or []
+            for alarm in alarms:
+                alarm_id  = str(alarm.get("alarmId") or alarm.get("id") or "")
+                event_type = alarm.get("alarmType") or alarm.get("type") or "Unknown"
+                alarm_time = alarm.get("alarmTime") or alarm.get("time") or ""
+                channel_id = str(alarm.get("channelId") or "0")
+                device_name = alarm.get("deviceName") or device_id
+
+                # Use thumbnail from alarm record (these are real JPEGs, unlike webhook .dav)
+                image_url = ""
+                pic_array = alarm.get("picurlArray") or alarm.get("imageUrls") or []
+                if isinstance(pic_array, list) and pic_array:
+                    image_url = pic_array[0]
+                else:
+                    image_url = alarm.get("thumbUrl") or alarm.get("imageUrl") or ""
+
+                _, is_new = db.save_notification(
+                    device_id, device_name, channel_id, event_type,
+                    alarm_time, image_url, alarm, alarm_id=alarm_id or None
+                )
+                if is_new:
+                    imported += 1
+        except Exception as e:
+            logger.warning("sync_notifications failed for %s: %s", device_id, e)
+            errors.append({"device_id": device_id, "error": str(e)})
+
+    logger.info("sync_notifications: imported %d new alarms from Imou (devices=%s, days=%d)", imported, device_ids, days)
+    return api_ok({"imported": imported, "errors": errors})
 
 
 # ─────────────────── Webhook endpoint ────────────────────────────────────────

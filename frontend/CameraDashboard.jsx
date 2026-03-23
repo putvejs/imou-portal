@@ -1175,6 +1175,27 @@ function App() {
     setUnreadCount(0);
   }
 
+  const [syncing, setSyncing] = useState(false);
+  async function syncAlarms() {
+    setSyncing(true);
+    try {
+      const res = await post('/notifications/sync', { days: 7 });
+      if (res.ok) {
+        // Reload notifications to show newly imported ones
+        const r = await get('/notifications?limit=200');
+        if (r.ok) {
+          setNotifications(r.data.notifications || []);
+          setUnreadCount(r.data.unread_count || 0);
+        }
+        alert(`Synced: ${res.data.imported} new alert(s) imported from Imou cloud.`);
+      } else {
+        alert('Sync failed: ' + (res.error || 'unknown error'));
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function markOneRead(id) {
     await post(`/notifications/${id}/read`);
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: 1 } : n));
@@ -1288,6 +1309,10 @@ function App() {
                     onClick={() => setAlertDayFilter(val)}>{label}</button>
                 ))}
               </div>
+              <button className="btn btn-sm" onClick={syncAlarms} disabled={syncing}
+                title="Pull missed alerts from Imou cloud (last 7 days)">
+                {syncing ? '⏳' : '⟳'} Sync
+              </button>
               {unreadCount > 0 && (
                 <button className="btn btn-sm" onClick={markAllRead}>Mark all read</button>
               )}
