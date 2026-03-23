@@ -1169,6 +1169,19 @@ function App() {
     return () => sseRef.current?.close();
   }, []);
 
+  // ── Periodic notification refresh (every 2 min) ──
+  // Catches alerts missed during SSE gaps without requiring a page reload
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const r = await get('/notifications?limit=200');
+      if (r.ok) {
+        setNotifications(r.data.notifications || []);
+        setUnreadCount(r.data.unread_count || 0);
+      }
+    }, 2 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   // ── Toast management ──
   function addToast(notif) {
     const id = Date.now();
