@@ -561,6 +561,18 @@ def imou_webhook():
         if not device_id:
             return "ok", 200
 
+        # Imou's webhook sends .dav video clips (Dahua format) which browsers can't display.
+        # Capture a live JPEG snapshot at alarm time instead — much more useful.
+        # Falls back to empty string if snapshot fails (don't block webhook processing).
+        try:
+            snap = imou.get_snapshot(device_id, channel_id)
+            jpeg_url = snap.get("url", "")
+            if jpeg_url:
+                image_url = jpeg_url
+                logger.debug("Alarm snapshot captured for %s: %s", device_id, jpeg_url[:60])
+        except Exception as snap_err:
+            logger.warning("Could not capture alarm snapshot for %s: %s", device_id, snap_err)
+
         notif_id = db.save_notification(
             device_id, device_name, channel_id, event_type, alarm_time, image_url, data
         )
