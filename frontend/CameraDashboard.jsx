@@ -1048,7 +1048,10 @@ function CameraAlerts({ deviceId, notifications, dayFilter, onMarkOne, onImageVi
             }}>
               {eventLabel(n.event_type)}
             </span>
-            <span className="cam-alert-time">{timeAgo(n.alarm_time || n.created_at)}</span>
+            <span className="cam-alert-time" title={new Date(n.alarm_time || n.created_at).toLocaleString()}>
+              {new Date(n.alarm_time || n.created_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'})}
+              {' '}<span style={{opacity:0.5, fontSize:'0.85em'}}>{timeAgo(n.alarm_time || n.created_at)}</span>
+            </span>
           </div>
         </div>
       ))}
