@@ -817,6 +817,8 @@ function SettingsModal({ onClose, user }) {
 
 function NotifImageModal({ notif, onClose, devices, onStream }) {
   const device = devices?.find(d => d.deviceId === notif.device_id);
+  const raw = notif.raw_data ? (typeof notif.raw_data === 'string' ? JSON.parse(notif.raw_data) : notif.raw_data) : {};
+  const clipUrl = raw.thumbUrl || '';
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -827,7 +829,7 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 3 }}>{eventLabel(notif.event_type)}</div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {notif.device_name} &nbsp;·&nbsp; {new Date(notif.alarm_time || notif.created_at).toLocaleString()}
+              {notif.device_name} &nbsp;·&nbsp; {(notif.alarm_time || notif.created_at || '').replace('T', ' ').substring(0, 19)}
             </div>
           </div>
           {device && (
@@ -850,6 +852,20 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
             <div style={{ fontSize: 48, marginBottom: 12, opacity: 0.3 }}>🎥</div>
             <div style={{ fontSize: 14, marginBottom: 6 }}>No snapshot for this alert</div>
             <div style={{ fontSize: 12 }}>New alerts will include a live snapshot automatically</div>
+          </div>
+        )}
+
+        {/* Video clip download */}
+        {clipUrl && (
+          <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+            <a
+              href={`/api/proxy/image?url=${encodeURIComponent(clipUrl)}`}
+              download={`alert-${notif.id}.dav`}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 6, background: 'rgba(255,255,255,0.07)', border: '1px solid var(--border)', color: 'var(--text)', textDecoration: 'none', fontSize: 13 }}
+            >
+              ⬇ Download clip (.dav)
+            </a>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Open with VLC media player</span>
           </div>
         )}
       </div>
