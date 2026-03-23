@@ -209,6 +209,7 @@ function StreamViewer({ device, onClose }) {
             <button
               key={sid}
               className={`btn${streamId === sid ? ' active' : ''}`}
+              disabled={loading}
               onClick={() => { setStreamId(sid); loadStream(sid); }}
             >
               {sid === 0 ? 'Main Stream (HD)' : 'Sub Stream (SD)'}

@@ -225,6 +225,15 @@ class ImouAPI:
                 # Stream already bound — fetch existing session instead of erroring
                 logger.info("LV1001 for %s — reusing existing live session", device_id)
                 result = self.get_live_stream_info(device_id, channel_id)
+            elif e.code == "OP1026":
+                # "Requests too frequent" — wait 3 seconds and retry once
+                logger.info("OP1026 for %s stream bind — waiting 3s then retrying", device_id)
+                time.sleep(3)
+                result = self._post_auth("bindDeviceLive", {
+                    "deviceId": device_id,
+                    "channelId": channel_id,
+                    "streamId": stream_id,
+                })
             else:
                 raise
 
