@@ -545,9 +545,12 @@ def sync_notifications():
     begin = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     end   = now.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # Determine which devices to sync
-    all_devices = imou.get_devices() if not target_device else None
-    device_ids = [target_device] if target_device else [d["deviceId"] for d in (all_devices or [])]
+    # Determine which devices to sync — use manually-registered devices from DB
+    if target_device:
+        device_ids = [target_device]
+    else:
+        manual = db.get_manual_devices()
+        device_ids = [d["device_id"] for d in manual]
 
     imported = 0
     errors = []
@@ -556,13 +559,16 @@ def sync_notifications():
             result = imou.get_alarm_list(device_id, begin_time=begin, end_time=end, limit=50)
             alarms = result.get("alarms") or result.get("list") or []
             for alarm in alarms:
-                alarm_id  = str(alarm.get("alarmId") or alarm.get("id") or "")
+                alarm_id   = str(alarm.get("alarmId") or alarm.get("id") or "")
                 event_type = alarm.get("alarmType") or alarm.get("type") or "Unknown"
                 alarm_time = alarm.get("alarmTime") or alarm.get("time") or ""
                 channel_id = str(alarm.get("channelId") or "0")
                 device_name = alarm.get("deviceName") or device_id
 
-                # Use thumbnail from alarm record (these are real JPEGs, unlike webhook .dav)
+                # Try to get image URL from the alarm record.
+                # Note: thumbUrl from Imou is often DHAV format (not JPEG) —
+                # store it anyway and let the proxy/frontend fail gracefully;
+                # the poll loop will try a fresh snapshot for new alarms.
                 image_url = ""
                 pic_array = alarm.get("picurlArray") or alarm.get("imageUrls") or []
                 if isinstance(pic_array, list) and pic_array:

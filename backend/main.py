@@ -67,16 +67,23 @@ def cache_alarm_snapshot(alarm_id: str, api_client, device_id: str, channel_id: 
         snap_url = result.get("url", "")
         if not snap_url:
             return ""
-        # Imou snapshot URLs need ~900ms for CDN upload before they're available
-        _time.sleep(1.0)
-        r = requests.get(snap_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        if r.content[:2] != b"\xff\xd8":
-            logger.warning("Snapshot for alarm %s is not JPEG (got %s)", alarm_id, r.content[:4])
-            return ""
-        with open(dest, "wb") as f:
-            f.write(r.content)
-        return f"/api/alarm-image/{alarm_id}"
+        # Imou returns the URL before the camera uploads the JPEG to CDN.
+        # Retry up to 4 times with exponential backoff (1s, 2s, 4s, 8s).
+        for attempt in range(4):
+            _time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+            try:
+                r = requests.get(snap_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                if r.content[:2] == b"\xff\xd8":
+                    # Valid JPEG — save and return
+                    with open(dest, "wb") as f:
+                        f.write(r.content)
+                    return f"/api/alarm-image/{alarm_id}"
+                logger.debug("Snapshot attempt %d for %s: not JPEG yet (%s)", attempt + 1, alarm_id, r.content[:4])
+            except Exception as dl_err:
+                logger.debug("Snapshot attempt %d for %s failed: %s", attempt + 1, alarm_id, dl_err)
+        logger.warning("Snapshot for alarm %s never became a valid JPEG after 4 attempts", alarm_id)
+        return ""
     except Exception as e:
         logger.warning("Failed to snapshot alarm image %s (%s): %s", alarm_id, device_id, e)
         return ""
