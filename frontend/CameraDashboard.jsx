@@ -873,10 +873,18 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
       const r = await get(`/devices/${device.deviceId}/snapshot`);
       if (r.ok && r.data?.url) {
         const url = r.data.url;
-        await new Promise(resolve => setTimeout(resolve, 900));
-        const img = new Image();
-        img.onload = () => { setSnapshot(url); setLastTs(new Date().toLocaleTimeString()); };
-        img.src = url;
+        // Imou uploads the snapshot to OSS asynchronously — the URL may 404 briefly.
+        // Retry up to 4 times with increasing delays (1s, 2s, 4s, 8s) before giving up.
+        const loadWithRetry = (url, attempt = 0) => {
+          const delay = Math.pow(2, attempt) * 1000;
+          setTimeout(() => {
+            const img = new Image();
+            img.onload = () => { setSnapshot(url); setLastTs(new Date().toLocaleTimeString()); };
+            img.onerror = () => { if (attempt < 3) loadWithRetry(url, attempt + 1); };
+            img.src = url;
+          }, delay);
+        };
+        loadWithRetry(url);
       } else if (r.status === 429 || r.error?.startsWith('rate_limited:')) {
         const secs = parseInt((r.error || '').split(':')[1] || '86400');
         rateLimitRef.current = Date.now() + secs * 1000;
