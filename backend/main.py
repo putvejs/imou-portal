@@ -63,7 +63,7 @@ def cache_alarm_snapshot(alarm_id: str, api_client, device_id: str, channel_id: 
         os.remove(dest)
     try:
         import time as _time
-        result = api_client.snapshot(device_id, channel_id)
+        result = api_client.get_snapshot(device_id, channel_id)
         snap_url = result.get("url", "")
         if not snap_url:
             return ""
@@ -163,10 +163,8 @@ def poll_alarms(api_client: ImouAPI):
                 )
                 if is_new:
                     new_count += 1
-                    # Try to grab a JPEG snapshot (Imou thumbUrls are DHAV format, not JPEG)
-                    image_url = cache_alarm_snapshot(alarm_id, api_client, device_id, "0")
-                    if image_url:
-                        _db.update_notification_image(row_id, image_url)
+                    # Broadcast immediately with no image; fetch snapshot in background
+                    # so we don't block the 60s poll loop (snapshot download can take ~15s)
                     flask_app_module.broadcast_event("notification", {
                         "id":          row_id,
                         "device_id":   device_id,
@@ -174,10 +172,18 @@ def poll_alarms(api_client: ImouAPI):
                         "channel_id":  "0",
                         "event_type":  event_type,
                         "alarm_time":  alarm_time,
-                        "image_url":   image_url,
+                        "image_url":   "",
                         "is_read":     False,
                         "created_at":  datetime.now(timezone.utc).isoformat(),
                     })
+                    # Fetch JPEG snapshot in a separate thread so it doesn't block polling
+                    def _fetch_img(rid, aid, did):
+                        img = cache_alarm_snapshot(aid, api_client, did, "0")
+                        if img:
+                            _db.update_notification_image(rid, img)
+                    threading.Thread(
+                        target=_fetch_img, args=(row_id, alarm_id, device_id), daemon=True
+                    ).start()
 
         except Exception as e:
             logger.warning("Alarm poll failed for %s: %s", device_id, e)
