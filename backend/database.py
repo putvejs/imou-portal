@@ -269,6 +269,28 @@ def update_notification_image(row_id: int, image_url: str):
         conn.close()
 
 
+def get_notifications_missing_images(limit=50, max_age_hours=24):
+    """Return recent notifications with alarm_id but no image_url for snapshot backfill."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, alarm_id, device_id
+            FROM notifications
+            WHERE alarm_id IS NOT NULL
+              AND alarm_id != ''
+              AND (image_url IS NULL OR image_url = '')
+              AND created_at >= datetime('now', ?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (f"-{int(max_age_hours)} hours", int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def delete_notifications(older_than_days=30):
     """Delete notifications older than N days."""
     conn = get_connection()

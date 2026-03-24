@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+import threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from werkzeug.security import generate_password_hash
@@ -133,14 +134,19 @@ def poll_alarms(api_client: ImouAPI):
     """
     import database as _db
     from datetime import datetime, timezone, timedelta
+    import pytz
 
     manual = _db.get_manual_devices()
     if not manual:
         return
 
-    # Look back 90 seconds (slightly more than the poll interval to catch edge cases)
-    now = datetime.now(timezone.utc)
-    begin = (now - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
+    # Imou API compares beginTime/endTime in device-local time (Europe/Riga).
+    # Lookback is 5 min (300s) — Imou API can take 1-3 min to publish a new alarm,
+    # so 90s was too short and would miss freshly-triggered alarms. Dedup by alarm_id
+    # ensures no duplicates even with the wider window.
+    _lv = pytz.timezone("Europe/Riga")
+    now = datetime.now(_lv)
+    begin = (now - timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
     end   = now.strftime("%Y-%m-%d %H:%M:%S")
 
     new_count = 0
@@ -181,7 +187,7 @@ def poll_alarms(api_client: ImouAPI):
                         "alarm_time":  alarm_time,
                         "image_url":   "",
                         "is_read":     False,
-                        "created_at":  datetime.now(timezone.utc).isoformat(),
+                        "created_at":  datetime.utcnow().isoformat() + "Z",
                     })
                     # Fetch JPEG snapshot in a separate thread so it doesn't block polling
                     def _fetch_img(rid, aid, did):
@@ -291,10 +297,12 @@ def create_app():
         refresh_devices(api_client)
         # Also backfill recent alarms (last 24h) on first startup
         import database as _db
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta
+        import pytz
         manual = _db.get_manual_devices()
         if manual:
-            now = datetime.now(timezone.utc)
+            _lv = pytz.timezone("Europe/Riga")
+            now = datetime.now(_lv)
             begin = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
             end   = now.strftime("%Y-%m-%d %H:%M:%S")
             new_total = 0
@@ -321,7 +329,21 @@ def create_app():
                     logger.warning("Startup alarm backfill failed for %s: %s", device["device_id"], e)
             logger.info("Startup alarm backfill: %d alerts loaded from last 24h", new_total)
 
-    import threading
+        # Backfill missing snapshots for recent alerts already in DB.
+        # This populates image_url for alerts that were saved without JPEGs.
+        missing = _db.get_notifications_missing_images(limit=60, max_age_hours=24)
+        fixed = 0
+        for n in missing:
+            try:
+                img = cache_alarm_snapshot(str(n["alarm_id"]), api_client, n["device_id"], "0")
+                if img:
+                    _db.update_notification_image(int(n["id"]), img)
+                    fixed += 1
+            except Exception as e:
+                logger.debug("Startup image backfill failed for notification %s: %s", n.get("id"), e)
+        if missing:
+            logger.info("Startup image backfill: %d/%d alerts updated", fixed, len(missing))
+
     threading.Thread(target=delayed_startup, daemon=True).start()
 
     logger.info("Imou Portal started on port %d", config.PORT)

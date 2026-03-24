@@ -292,7 +292,9 @@ def device_stream(device_id):
         # Bind stream first, then get URLs
         bind_result = imou.bind_live_stream(device_id, channel_id, stream_id)
         stream_info = imou.get_live_stream_info(device_id, channel_id)
-        return api_ok({**bind_result, **stream_info})
+        # Keep bind_result URL normalization (incl. preferred HTTPS variants)
+        # and use stream_info only as fallback for any missing fields.
+        return api_ok({**stream_info, **bind_result})
     except Exception as e:
         logger.error("stream failed for %s: %s", device_id, e)
         return api_err(str(e))
@@ -540,8 +542,11 @@ def sync_notifications():
     target_device = body.get("device_id")
     days = min(int(body.get("days", 3)), 7)  # cap at 7 days to limit API calls
 
-    # Build time window: days back → now, formatted as Imou expects (ISO 8601 UTC)
-    now = datetime.utcnow()
+    # Build time window in LV local time — Imou API compares beginTime/endTime
+    # against device-local timestamps, not UTC.
+    import pytz
+    _lv = pytz.timezone("Europe/Riga")
+    now = datetime.now(_lv)
     begin = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     end   = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -558,27 +563,35 @@ def sync_notifications():
         try:
             result = imou.get_alarm_list(device_id, begin_time=begin, end_time=end, limit=50)
             alarms = result.get("alarms") or result.get("list") or []
+            ALARM_TYPE_MAP = {
+                "1":"Motion","2":"Motion","3":"Motion","10":"AlarmMotion",
+                "11":"AlarmLine","12":"AlarmRegion","13":"AlarmLine","14":"AlarmRegion",
+                "110":"AlarmMotion","111":"AlarmMotion","120":"AlarmHumanDetection",
+                "121":"AlarmHumanDetection","122":"AlarmHumanDetection","130":"AlarmFace",
+                "140":"AlarmSound","150":"AlarmSmoke","160":"AlarmTamper",
+            }
             for alarm in alarms:
                 alarm_id   = str(alarm.get("alarmId") or alarm.get("id") or "")
-                event_type = alarm.get("alarmType") or alarm.get("type") or "Unknown"
-                alarm_time = alarm.get("alarmTime") or alarm.get("time") or ""
-                channel_id = str(alarm.get("channelId") or "0")
-                device_name = alarm.get("deviceName") or device_id
+                event_type = ALARM_TYPE_MAP.get(str(alarm.get("type", "")),
+                             alarm.get("alarmType") or f"Alarm_{alarm.get('type')}")
+                # Use localDate (LV local time string) — same as poll_alarms.
+                # Fall back to converting the Unix timestamp to LV local time.
+                alarm_time = alarm.get("localDate") or ""
+                if not alarm_time:
+                    raw_ts = alarm.get("time") or alarm.get("alarmTime") or ""
+                    try:
+                        ts = int(raw_ts)
+                        alarm_time = datetime.fromtimestamp(ts, tz=_lv).strftime("%Y-%m-%d %H:%M:%S")
+                    except (ValueError, TypeError, OSError):
+                        alarm_time = str(raw_ts)
+                channel_id  = str(alarm.get("channelId") or "0")
+                device_name = alarm.get("name") or alarm.get("deviceName") or device_id
 
-                # Try to get image URL from the alarm record.
-                # Note: thumbUrl from Imou is often DHAV format (not JPEG) —
-                # store it anyway and let the proxy/frontend fail gracefully;
-                # the poll loop will try a fresh snapshot for new alarms.
-                image_url = ""
-                pic_array = alarm.get("picurlArray") or alarm.get("imageUrls") or []
-                if isinstance(pic_array, list) and pic_array:
-                    image_url = pic_array[0]
-                else:
-                    image_url = alarm.get("thumbUrl") or alarm.get("imageUrl") or ""
-
+                # Never store thumbUrl — it is DHAV format (not JPEG).
+                # Leave image_url empty so the snapshot background thread fetches a real JPEG.
                 _, is_new = db.save_notification(
                     device_id, device_name, channel_id, event_type,
-                    alarm_time, image_url, alarm, alarm_id=alarm_id or None
+                    alarm_time, "", alarm, alarm_id=alarm_id or None
                 )
                 if is_new:
                     imported += 1
@@ -643,7 +656,7 @@ def imou_webhook():
         except Exception as snap_err:
             logger.warning("Could not capture alarm snapshot for %s: %s", device_id, snap_err)
 
-        notif_id = db.save_notification(
+        notif_id, _ = db.save_notification(
             device_id, device_name, channel_id, event_type, alarm_time, image_url, data
         )
 

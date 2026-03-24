@@ -876,52 +876,105 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
 // ─────────────────── Camera Card ─────────────────────────────────────────────
 
 function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onCameraSettings }) {
-  const [snapshot, setSnapshot] = useState(null);
-  const [lastTs, setLastTs]     = useState('');
-  const intervalRef             = useRef(null);
-  const fetchingRef             = useRef(false);  // prevent concurrent fetches
-
-  const refreshInterval = parseInt(settings?.snapshot_interval || '900') * 1000;
-  const rateLimitRef = useRef(0);  // epoch ms until which snapshots are paused
-
-  async function fetchSnapshot() {
-    if (fetchingRef.current) return;
-    if (Date.now() < rateLimitRef.current) return;
-    fetchingRef.current = true;
+  const [streamError, setStreamError] = useState('');
+  const [connecting, setConnecting]   = useState(true);
+  const [streamQuality, setStreamQuality] = useState(() => {
     try {
-      const r = await get(`/devices/${device.deviceId}/snapshot`);
-      if (r.ok && r.data?.url) {
-        const url = r.data.url;
-        // Imou uploads the snapshot to OSS asynchronously — the URL may 404 briefly.
-        // Retry up to 4 times with increasing delays (1s, 2s, 4s, 8s) before giving up.
-        const loadWithRetry = (url, attempt = 0) => {
-          const delay = Math.pow(2, attempt) * 1000;
-          setTimeout(() => {
-            const img = new Image();
-            img.onload = () => { setSnapshot(url); setLastTs(new Date().toLocaleTimeString()); };
-            img.onerror = () => { if (attempt < 3) loadWithRetry(url, attempt + 1); };
-            img.src = url;
-          }, delay);
-        };
-        loadWithRetry(url);
-      } else if (r.status === 429 || r.error?.startsWith('rate_limited:')) {
-        const secs = parseInt((r.error || '').split(':')[1] || '86400');
-        rateLimitRef.current = Date.now() + secs * 1000;
-        const waitStr = secs >= 3600 ? `${Math.ceil(secs/3600)}h` : `${Math.ceil(secs/60)}m`;
-        setLastTs(`⏳ Monthly quota hit — retry in ${waitStr}`);
+      // 1 = sub stream (SD), 0 = main stream (HD)
+      return localStorage.getItem(`imou-card-quality:${device.deviceId}`) === '0' ? 0 : 1;
+    } catch (_) {
+      return 1;
+    }
+  });
+  const videoRef = useRef(null);
+  const hlsRef   = useRef(null);
+
+  function teardownPlayer() {
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.removeAttribute('src');
+      videoRef.current.load();
+    }
+  }
+
+  function attachHls(hlsUrl) {
+    const video = videoRef.current;
+    if (!video) return;
+
+    teardownPlayer();
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: true });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setConnecting(false);
+        video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) {
+          setStreamError('Live stream failed');
+          setConnecting(false);
+        }
+      });
+      hlsRef.current = hls;
+      return;
+    }
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl;
+      video.onloadedmetadata = () => {
+        setConnecting(false);
+        video.play().catch(() => {});
+      };
+      return;
+    }
+
+    setStreamError('HLS is not supported in this browser');
+    setConnecting(false);
+  }
+
+  async function startLivePreview(streamId = streamQuality, allowFallback = true) {
+    setConnecting(true);
+    setStreamError('');
+    try {
+      const res = await post(`/devices/${device.deviceId}/stream`, { streamId });
+      if (!res.ok) {
+        throw new Error(res.error || 'Could not open stream');
       }
-    } catch (e) { /* keep last snapshot */ }
-    finally { fetchingRef.current = false; }
+      const data = res.data || {};
+      const hlsUrl = streamId === 1 ? (data.subHls || data.hls) : (data.hls || data.subHls);
+      if (!hlsUrl) {
+        throw new Error('No HLS URL returned');
+      }
+      attachHls(hlsUrl);
+    } catch (e) {
+      // Some devices/accounts cannot provide HD consistently; fallback to SD.
+      if (streamId === 0 && allowFallback) {
+        setStreamQuality(1);
+        startLivePreview(1, false);
+        return;
+      }
+      setStreamError(e.message || 'Could not open stream');
+      setConnecting(false);
+    }
   }
 
   useEffect(() => {
-    const staggerMs = (device.deviceId.charCodeAt(0) % 5) * 1800;
-    const t = setTimeout(() => {
-      fetchSnapshot();
-      intervalRef.current = setInterval(fetchSnapshot, refreshInterval);
-    }, staggerMs);
-    return () => { clearTimeout(t); clearInterval(intervalRef.current); };
-  }, [device.deviceId, refreshInterval]);
+    try {
+      localStorage.setItem(`imou-card-quality:${device.deviceId}`, String(streamQuality));
+    } catch (_) {
+      // Ignore storage errors in private mode.
+    }
+
+    startLivePreview(streamQuality);
+    return () => {
+      teardownPlayer();
+      post(`/devices/${device.deviceId}/stream/unbind`, { channel: '0' }).catch(() => {});
+    };
+  }, [device.deviceId, streamQuality]);
 
   const isPTZ = hasAbility(device, 'PT') || hasAbility(device, 'PTZ');
 
@@ -929,22 +982,30 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
     <div className={`camera-card${selected ? ' selected' : ''}`} onClick={() => onSelect(device)}>
       {/* Video area */}
       <div className="camera-view">
-        {snapshot ? (
-          // Direct URL — no proxy. <img> tags load cross-origin without CORS restriction.
-          <img src={snapshot} alt={device.name} style={{ transition: 'opacity 0.3s' }} />
+        {!streamError ? (
+          <video
+            ref={videoRef}
+            muted
+            autoPlay
+            playsInline
+            controls={false}
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
         ) : (
           <div className="no-signal">
             <div className="no-signal-icon">📷</div>
-            <div>Connecting…</div>
+            <div>{streamError}</div>
           </div>
         )}
 
         {/* Overlays */}
-        {snapshot && (
+        {!streamError && !connecting && (
           <div className="live-badge">LIVE</div>
         )}
 
-        <div className="camera-timestamp">{lastTs}</div>
+        <div className="camera-timestamp">
+          {connecting ? 'Connecting…' : `Live ${streamQuality === 1 ? 'SD' : 'HD'}`}
+        </div>
 
         {/* Action overlay on hover */}
         <div className="camera-overlay">
@@ -967,9 +1028,16 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
           <button
             className="btn btn-sm"
             style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
-            onClick={e => { e.stopPropagation(); fetchSnapshot(); }}
+            onClick={e => { e.stopPropagation(); setStreamQuality(q => q === 1 ? 0 : 1); }}
           >
-            📷
+            {streamQuality === 1 ? 'HD' : 'SD'}
+          </button>
+          <button
+            className="btn btn-sm"
+            style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+            onClick={e => { e.stopPropagation(); startLivePreview(); }}
+          >
+            ↻ Reconnect
           </button>
         </div>
       </div>
@@ -1006,8 +1074,11 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
               🕹 Control
             </button>
           )}
-          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); fetchSnapshot(); }}>
-            📷 Snap
+          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); setStreamQuality(q => q === 1 ? 0 : 1); }}>
+            {streamQuality === 1 ? 'HD' : 'SD'}
+          </button>
+          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); startLivePreview(); }}>
+            ↻ Reconnect
           </button>
         </div>
       </div>
