@@ -195,6 +195,29 @@ def get_device(device_id: str):
         conn.close()
 
 
+def update_device_status(device_id: str, status: str):
+    """Update the status field inside device_cache JSON for a single device."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT data FROM device_cache WHERE device_id=?", (device_id,)).fetchone()
+        if row:
+            d = json.loads(row["data"])
+            d["status"] = status
+            conn.execute(
+                "UPDATE device_cache SET data=?, updated_at=datetime('now') WHERE device_id=?",
+                (json.dumps(d), device_id)
+            )
+        else:
+            # Device not in cache yet — create a minimal entry
+            conn.execute(
+                "INSERT INTO device_cache (device_id, data, updated_at) VALUES (?, ?, datetime('now'))",
+                (device_id, json.dumps({"deviceId": device_id, "status": status}))
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ─────────────────────────────── Notifications ───────────────────────────────
 
 def save_notification(device_id, device_name, channel_id, event_type, alarm_time, image_url, raw_data, alarm_id=None):

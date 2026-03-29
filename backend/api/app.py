@@ -231,16 +231,40 @@ def device_detail(device_id):
         return api_err(str(e))
 
 
-# Snapshot rate-limit state.
+# Snapshot state.
 # Imou free tier: 30,000 API calls/month → ~1,000/day budget.
-# OP1013 = monthly quota exhausted (not per-second limit).
-# We serialize all snapshot requests through a single lock with a minimum
-# 1.1-second gap between calls so concurrent camera cards never pile up.
-# At the default 15-min interval: 5 cameras × 96 calls/day = 480 calls/day ✓
+# At 5-min interval: 5 cameras × 288/day = 1,440/day — acceptable on standard plan.
+# OP1013 = monthly quota exhausted.
+# We download and save each snapshot to disk so the browser always gets a real JPEG.
+# setDeviceSnapEnhanced returns the CDN URL before the camera uploads — we retry
+# fetching it until we have a valid JPEG (up to ~12 seconds).
 _snapshot_lock = threading.Lock()
-_snapshot_last_call = 0.0        # epoch seconds of last successful API call
-_SNAPSHOT_MIN_GAP = 1.1          # seconds between Imou snapshot calls
-_snapshot_blocked_until = 0      # epoch seconds; hard backoff after OP1013
+_snapshot_last_call = 0.0
+_SNAPSHOT_MIN_GAP = 1.1
+_snapshot_blocked_until = 0
+_SNAP_DIR = "/data/snapshots"
+_SNAP_CACHE_TTL = 5 * 60  # 5 minutes — don't re-fetch from Imou before this
+
+
+def _save_snapshot(device_id: str, cdn_url: str) -> bool:
+    """Download JPEG from Imou CDN (with retries) and save to disk. Returns True on success."""
+    os.makedirs(_SNAP_DIR, exist_ok=True)
+    dest = os.path.join(_SNAP_DIR, f"{device_id}.jpg")
+    for delay in (0, 2, 4, 6):
+        time.sleep(delay)
+        try:
+            r = requests.get(cdn_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.content[:2] == b"\xff\xd8":
+                with open(dest, "wb") as f:
+                    f.write(r.content)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# {device_id: float} — epoch of last successful snapshot save
+_snap_saved_at = {}
 
 
 @app.route("/api/devices/<device_id>/snapshot")
@@ -248,20 +272,27 @@ _snapshot_blocked_until = 0      # epoch seconds; hard backoff after OP1013
 def device_snapshot(device_id):
     global _snapshot_blocked_until, _snapshot_last_call
     channel_id = request.args.get("channel", "0")
+    snap_path = os.path.join(_SNAP_DIR, f"{device_id}.jpg")
 
-    # Hard backoff: OP1013 was hit recently — tell the client to wait
+    # If saved file is fresh enough, return it without calling Imou API
+    saved_at = _snap_saved_at.get(device_id, 0)
+    if os.path.exists(snap_path) and (time.time() - saved_at) < _SNAP_CACHE_TTL:
+        return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": saved_at})
+
+    # Hard backoff after OP1013
     if time.time() < _snapshot_blocked_until:
         wait = int(_snapshot_blocked_until - time.time())
+        # Return stale file if available rather than an error
+        if os.path.exists(snap_path):
+            return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": saved_at})
         return api_err(f"rate_limited:{wait}", 429)
 
-    # Serialize: only one snapshot call to Imou at a time, with minimum gap
     with _snapshot_lock:
-        # Re-check backoff after acquiring the lock (another thread may have set it)
-        if time.time() < _snapshot_blocked_until:
-            wait = int(_snapshot_blocked_until - time.time())
-            return api_err(f"rate_limited:{wait}", 429)
+        # Re-check after acquiring lock
+        saved_at = _snap_saved_at.get(device_id, 0)
+        if os.path.exists(snap_path) and (time.time() - saved_at) < _SNAP_CACHE_TTL:
+            return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": saved_at})
 
-        # Enforce minimum gap between consecutive Imou calls
         gap = _SNAPSHOT_MIN_GAP - (time.time() - _snapshot_last_call)
         if gap > 0:
             time.sleep(gap)
@@ -269,17 +300,32 @@ def device_snapshot(device_id):
         try:
             result = imou.get_snapshot(device_id, channel_id)
             _snapshot_last_call = time.time()
-            return api_ok(result)
+            cdn_url = result.get("url", "")
+            if cdn_url and _save_snapshot(device_id, cdn_url):
+                now = time.time()
+                _snap_saved_at[device_id] = now
+                return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": now})
+            return api_err("Snapshot upload pending — retry shortly")
         except Exception as e:
             err = str(e)
             logger.error("snapshot failed for %s: %s", device_id, err)
             if "OP1013" in err:
-                # Monthly quota exhausted (30k/month free tier). Block for 24h.
-                # Monitor usage at: open.imoulife.com/consoleNew/resourceManage/myResource
                 _snapshot_blocked_until = time.time() + 86400
-                logger.warning("OP1013 monthly quota hit — snapshots blocked for 24h. Check usage at open.imoulife.com/consoleNew/resourceManage/myResource")
+                logger.warning("OP1013 monthly quota hit — snapshots blocked for 24h.")
+                if os.path.exists(snap_path):
+                    return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": saved_at})
                 return api_err("rate_limited:86400", 429)
+            if os.path.exists(snap_path):
+                return api_ok({"path": f"/api/device-snapshot/{device_id}", "ts": saved_at})
             return api_err(err)
+
+
+@app.route("/api/device-snapshot/<device_id>")
+@login_required
+def serve_device_snapshot(device_id):
+    """Serve the saved snapshot JPEG for a device."""
+    return send_from_directory(_SNAP_DIR, f"{device_id}.jpg",
+                               max_age=0, conditional=True)
 
 
 @app.route("/api/devices/<device_id>/stream", methods=["POST"])
@@ -311,6 +357,7 @@ def unbind_stream(device_id):
     except Exception as e:
         logger.error("unbind stream failed: %s", e)
         return api_err(str(e))
+
 
 
 @app.route("/api/devices/<device_id>/ptz", methods=["POST"])
@@ -616,48 +663,73 @@ def imou_webhook():
         challenge = request.args.get("echostr", request.args.get("challenge", "ok"))
         return challenge, 200
 
-    # POST — actual alarm event
+    # POST — actual alarm event or device status change
     try:
         # Imou sometimes sends malformed HTTP; be lenient with parsing
         data = request.get_json(force=True, silent=True) or {}
         logger.info("Webhook received: %s", json.dumps(data)[:500])
 
-        # Normalize fields across different Imou firmware versions
-        device_id = (data.get("deviceId") or data.get("device_id") or "").strip()
-        device_name = data.get("deviceName") or data.get("device_name") or device_id
-        channel_id = str(data.get("channelId") or data.get("channel_id") or "0")
-        event_type = (data.get("alarmType") or data.get("alarm_type") or
-                      data.get("msgType") or "Unknown")
-        alarm_time = data.get("alarmTime") or data.get("alarm_time") or datetime.utcnow().isoformat()
+        # ── Device Status Messages (online / offline / sleep) ─────────────────
+        # easy4ip sends msgType: "offline"/"online" (no action field for status events).
+        # Older firmware may use action: "online"/"offline" instead.
+        _action = (data.get("action") or data.get("msgType") or "").lower()
+        if _action in ("online", "offline", "sleep", "informationtransfer", "keepalive"):
+            _did = (data.get("did") or data.get("deviceId") or "").strip()
+            _dname = data.get("dname") or data.get("cname") or data.get("deviceName") or _did
+            _status = "online" if _action == "online" else "offline"
+            if _did:
+                # Update status in device_cache so the next /api/devices response is correct
+                db.update_device_status(_did, _status)
+                # Push real-time update to all connected browser clients via SSE
+                broadcast_event("device_status", {"device_id": _did, "device_name": _dname, "status": _status})
+                logger.info("Device %s (%s) is now %s", _dname, _did, _status)
+            return "ok", 200
+        # ─────────────────────────────────────────────────────────────────────
 
-        # Image URL — Imou uses picurlArray (list) or thumbUrl (string)
-        # Also handle legacy field names from older firmware
-        image_url = ""
-        pic_array = data.get("picurlArray") or data.get("imageUrls") or []
-        if isinstance(pic_array, list) and pic_array:
-            image_url = pic_array[0]
-        else:
-            raw = data.get("thumbUrl") or data.get("image_url") or data.get("imageUrl") or ""
-            if isinstance(raw, str):
-                image_url = raw
+        # Normalize fields — easy4ip PaaS webhooks use short field names (did/cid/dname)
+        # while older firmware uses long names (deviceId/channelId/deviceName).
+        device_id = (data.get("deviceId") or data.get("device_id") or
+                     data.get("did") or "").strip()
+        device_name = (data.get("deviceName") or data.get("device_name") or
+                       data.get("dname") or data.get("cname") or device_id)
+        channel_id = str(data.get("channelId") or data.get("channel_id") or
+                         data.get("cid") or "0")
+        alarm_id_raw = str(data.get("alarmId") or data.get("id") or "")
+        # Map easy4ip PaaS msgType/labelType to the same normalized strings used by poll_alarms
+        _WEBHOOK_TYPE_MAP = {
+            "human": "AlarmHumanDetection", "humanalarm": "AlarmHumanDetection",
+            "motion": "AlarmMotion", "motionalarm": "AlarmMotion",
+            "line": "AlarmLine", "linealarm": "AlarmLine",
+            "region": "AlarmRegion", "regionalarm": "AlarmRegion",
+            "face": "AlarmFace", "facealarm": "AlarmFace",
+            "sound": "AlarmSound", "soundalarm": "AlarmSound",
+        }
+        _raw_type = (data.get("alarmType") or data.get("alarm_type") or
+                     data.get("msgType") or data.get("labelType") or "Unknown")
+        event_type = _WEBHOOK_TYPE_MAP.get(_raw_type.lower(), _raw_type)
+        # time/utcTime are Unix timestamps — convert to LV local time string
+        _raw_time = data.get("alarmTime") or data.get("alarm_time")
+        if not _raw_time:
+            _ts = data.get("utcTime") or data.get("time")
+            if _ts:
+                try:
+                    import pytz as _pytz
+                    _lv = _pytz.timezone("Europe/Riga")
+                    _raw_time = datetime.fromtimestamp(int(_ts), tz=_pytz.utc).astimezone(_lv).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    _raw_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                _raw_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        alarm_time = _raw_time
 
         if not device_id:
             return "ok", 200
 
-        # Imou's webhook sends .dav video clips (Dahua format) which browsers can't display.
-        # Capture a live JPEG snapshot at alarm time instead — much more useful.
-        # Falls back to empty string if snapshot fails (don't block webhook processing).
-        try:
-            snap = imou.get_snapshot(device_id, channel_id)
-            jpeg_url = snap.get("url", "")
-            if jpeg_url:
-                image_url = jpeg_url
-                logger.debug("Alarm snapshot captured for %s: %s", device_id, jpeg_url[:60])
-        except Exception as snap_err:
-            logger.warning("Could not capture alarm snapshot for %s: %s", device_id, snap_err)
-
-        notif_id, _ = db.save_notification(
-            device_id, device_name, channel_id, event_type, alarm_time, image_url, data
+        # Save the notification immediately with no image so the alarm is recorded fast.
+        # Pass alarm_id_raw so this deduplicates against the same alarm found by poll_alarms.
+        notif_id, is_new = db.save_notification(
+            device_id, device_name, channel_id, event_type, alarm_time, "", data,
+            alarm_id=alarm_id_raw or None
         )
 
         notification = {
@@ -667,12 +739,32 @@ def imou_webhook():
             "channel_id": channel_id,
             "event_type": event_type,
             "alarm_time": alarm_time,
-            "image_url": image_url,
+            "image_url": "",
             "is_read": False,
             "created_at": datetime.utcnow().isoformat(),
         }
         broadcast_event("notification", notification)
         logger.info("Notification saved: %s from %s (%s)", event_type, device_name, device_id)
+
+        if is_new:
+            # Take a live snapshot in background — camera is still recording the alarm event.
+            # Skip the .dav approach: Imou's DHAV files are encrypted and cannot be decoded.
+            # The live snapshot captures the event in progress (within the recording window).
+            def _fetch_webhook_image(nid, did, cid):
+                from main import cache_alarm_snapshot
+                # Pass dav_url="" to skip directly to live snapshot (no wasted download time)
+                img = cache_alarm_snapshot(str(nid), imou, did, cid, dav_url="")
+                if img:
+                    db.update_notification_image(nid, img)
+                    logger.info("Webhook snapshot saved for notification %d", nid)
+                else:
+                    logger.warning("Webhook snapshot failed for notification %d", nid)
+
+            threading.Thread(
+                target=_fetch_webhook_image,
+                args=(notif_id, device_id, channel_id),
+                daemon=True,
+            ).start()
 
     except Exception as e:
         logger.error("Webhook processing error: %s", e)

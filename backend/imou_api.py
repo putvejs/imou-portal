@@ -271,6 +271,40 @@ class ImouAPI:
             "channelId": channel_id,
         })
 
+    # ────────────────────────── Cloud Playback ──────────────────────────────
+
+    def bind_playback(self, device_id: str, channel_id: str = "0",
+                      begin_time: str = "", end_time: str = "",
+                      stream_id: int = 1) -> dict:
+        """
+        Create a cloud playback session for a time range.
+        begin_time / end_time: ISO 8601 strings e.g. "2024-01-15T10:30:00"
+        stream_id: 0=main (HD), 1=sub (SD — less bandwidth)
+        Returns dict with HLS URL for browser playback.
+        """
+        result = self._post_auth("bindDevicePlayback", {
+            "deviceId": device_id,
+            "channelId": channel_id,
+            "beginTime": begin_time,
+            "endTime": end_time,
+            "streamId": stream_id,
+        })
+        # Normalise streams array same as live stream
+        streams = result.get("streams", [])
+        if streams and isinstance(streams, list):
+            matching = [s for s in streams if "proto=https" in s.get("hls", "")]
+            if not matching:
+                matching = streams
+            result["hls"] = matching[0].get("hls", "")
+        return result
+
+    def unbind_playback(self, device_id: str, token: str) -> dict:
+        """Release a cloud playback session."""
+        return self._post_auth("unbindDevicePlayback", {
+            "deviceId": device_id,
+            "liveToken": token,
+        })
+
     # ────────────────────────── Snapshots ───────────────────────────────────
 
     def get_snapshot(self, device_id: str, channel_id: str = "0") -> dict:

@@ -145,32 +145,57 @@ function StreamViewer({ device, onClose }) {
   const [streamData, setStreamData] = useState(null);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState(null);
+  const [reconnecting, setReconnecting] = useState(false);
   const [streamId, setStreamId] = useState(0); // 0=main, 1=sub
-  const videoRef = useRef(null);
-  const hlsRef   = useRef(null);
+  const videoRef    = useRef(null);
+  const hlsRef      = useRef(null);
+  const retryTimerRef = useRef(null);
+  const retryCountRef = useRef(0);
+  const mountedRef  = useRef(true);
 
   async function loadStream(sid = streamId) {
+    if (!mountedRef.current) return;
     setLoading(true);
     setError(null);
+    setReconnecting(false);
     setStreamData(null);
     try {
       const res = await post(`/devices/${device.deviceId}/stream`, { streamId: sid });
+      if (!mountedRef.current) return;
       if (res.ok) {
+        retryCountRef.current = 0;
         setStreamData(res.data);
       } else {
         setError(res.error || 'Failed to get stream');
+        scheduleReconnect(sid);
       }
     } catch (e) {
-      setError(e.message);
+      if (mountedRef.current) {
+        setError(e.message);
+        scheduleReconnect(sid);
+      }
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
   }
 
+  function scheduleReconnect(sid) {
+    if (!mountedRef.current) return;
+    retryCountRef.current += 1;
+    // Backoff: 3s, 6s, 12s, 24s, then cap at 30s
+    const delay = Math.min(3000 * Math.pow(2, retryCountRef.current - 1), 30000);
+    setReconnecting(true);
+    retryTimerRef.current = setTimeout(() => {
+      if (mountedRef.current) loadStream(sid);
+    }, delay);
+  }
+
   useEffect(() => {
+    mountedRef.current = true;
     loadStream();
     return () => {
-      // Unbind stream on close to release server resources
+      mountedRef.current = false;
+      clearTimeout(retryTimerRef.current);
       post(`/devices/${device.deviceId}/stream/unbind`, { channel: '0' }).catch(() => {});
       if (hlsRef.current) hlsRef.current.destroy();
     };
@@ -188,13 +213,17 @@ function StreamViewer({ device, onClose }) {
       hls.attachMedia(videoRef.current);
       hls.on(Hls.Events.MANIFEST_PARSED, () => videoRef.current?.play().catch(() => {}));
       hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) setError('Stream error: ' + data.type);
+        if (data.fatal) {
+          hls.destroy();
+          if (mountedRef.current) scheduleReconnect(streamId);
+        }
       });
       hlsRef.current = hls;
     } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
       // Native HLS on Safari
       videoRef.current.src = hlsUrl;
       videoRef.current.play().catch(() => {});
+      videoRef.current.onerror = () => scheduleReconnect(streamId);
     } else {
       setError('HLS not supported in this browser. Copy the stream URL to use in VLC.');
     }
@@ -226,7 +255,14 @@ function StreamViewer({ device, onClose }) {
           </div>
         )}
 
-        {error && (
+        {reconnecting && !loading && (
+          <div style={{ textAlign: 'center', padding: 24 }}>
+            <div className="spinner" style={{ margin: '0 auto' }} />
+            <div style={{ marginTop: 12, color: 'var(--text-muted)' }}>Stream dropped — reconnecting…</div>
+          </div>
+        )}
+
+        {error && !reconnecting && (
           <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: 16, color: 'var(--danger)', fontSize: 13 }}>
             ⚠️ {error}
           </div>
@@ -818,7 +854,7 @@ function SettingsModal({ onClose, user }) {
 function NotifImageModal({ notif, onClose, devices, onStream }) {
   const device = devices?.find(d => d.deviceId === notif.device_id);
   const raw = notif.raw_data ? (typeof notif.raw_data === 'string' ? JSON.parse(notif.raw_data) : notif.raw_data) : {};
-  const clipUrl = raw.thumbUrl || '';
+  const clipUrl = raw.thumbUrl || raw.picUrl || '';
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -840,7 +876,7 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: 18, cursor: 'pointer', padding: '2px 6px', lineHeight: 1 }}>✕</button>
         </div>
 
-        {/* Content */}
+        {/* Snapshot */}
         {notif.image_url ? (
           <img
             src={notif.image_url.startsWith('/') ? notif.image_url + '?v=4' : `/api/proxy/image?url=${encodeURIComponent(notif.image_url)}`}
@@ -855,7 +891,7 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
           </div>
         )}
 
-        {/* Video clip download */}
+        {/* Footer: clip download (SD card recordings — browser/VLC can't play encrypted .dav) */}
         {clipUrl && (
           <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
             <a
@@ -865,7 +901,7 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
             >
               ⬇ Download clip (.dav)
             </a>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Open with VLC media player</span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Play with SmartPSS or Imou app — VLC cannot open Imou's encrypted .dav files</span>
           </div>
         )}
       </div>
@@ -876,170 +912,176 @@ function NotifImageModal({ notif, onClose, devices, onStream }) {
 // ─────────────────── Camera Card ─────────────────────────────────────────────
 
 function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onCameraSettings }) {
+  const [streaming, setStreaming]     = useState(false);
   const [streamError, setStreamError] = useState('');
-  const [connecting, setConnecting]   = useState(true);
-  const [streamQuality, setStreamQuality] = useState(() => {
-    try {
-      // 1 = sub stream (SD), 0 = main stream (HD)
-      return localStorage.getItem(`imou-card-quality:${device.deviceId}`) === '0' ? 0 : 1;
-    } catch (_) {
-      return 1;
-    }
-  });
-  const videoRef = useRef(null);
-  const hlsRef   = useRef(null);
+  const [connecting, setConnecting]   = useState(false);
+  const [thumbUrl, setThumbUrl]       = useState(null);
+  const [thumbTs, setThumbTs]         = useState(null); // Date of last snapshot
+  const videoRef   = useRef(null);
+  const hlsRef     = useRef(null);
+  const mountedRef = useRef(true);
+  const thumbTimer = useRef(null);
+
+  const THUMB_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+  const isPTZ = hasAbility(device, 'PT') || hasAbility(device, 'PTZ');
 
   function teardownPlayer() {
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.removeAttribute('src');
-      videoRef.current.load();
-    }
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+    if (videoRef.current) { videoRef.current.removeAttribute('src'); videoRef.current.load(); }
+  }
+
+  function stopStream() {
+    teardownPlayer();
+    post(`/devices/${device.deviceId}/stream/unbind`, { channel: '0' }).catch(() => {});
+    setStreaming(false);
+    setStreamError('');
+    setConnecting(false);
   }
 
   function attachHls(hlsUrl) {
     const video = videoRef.current;
     if (!video) return;
-
     teardownPlayer();
     if (Hls.isSupported()) {
       const hls = new Hls({ enableWorker: true });
       hls.loadSource(hlsUrl);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setConnecting(false);
-        video.play().catch(() => {});
-      });
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) {
-          setStreamError('Live stream failed');
-          setConnecting(false);
-        }
-      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (mountedRef.current) { setConnecting(false); video.play().catch(() => {}); } });
+      hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal && mountedRef.current) { setStreamError('Stream lost'); setConnecting(false); } });
       hlsRef.current = hls;
       return;
     }
-
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = hlsUrl;
-      video.onloadedmetadata = () => {
-        setConnecting(false);
-        video.play().catch(() => {});
-      };
+      video.onloadedmetadata = () => { if (mountedRef.current) { setConnecting(false); video.play().catch(() => {}); } };
       return;
     }
-
-    setStreamError('HLS is not supported in this browser');
+    setStreamError('HLS not supported in this browser');
     setConnecting(false);
   }
 
-  async function startLivePreview(streamId = streamQuality, allowFallback = true) {
+  async function startStream() {
+    setStreaming(true);
     setConnecting(true);
     setStreamError('');
     try {
-      const res = await post(`/devices/${device.deviceId}/stream`, { streamId });
-      if (!res.ok) {
-        throw new Error(res.error || 'Could not open stream');
-      }
-      const data = res.data || {};
-      const hlsUrl = streamId === 1 ? (data.subHls || data.hls) : (data.hls || data.subHls);
-      if (!hlsUrl) {
-        throw new Error('No HLS URL returned');
-      }
+      const res = await post(`/devices/${device.deviceId}/stream`, { streamId: 1 }); // SD by default
+      if (!mountedRef.current) return;
+      if (!res.ok) throw new Error(res.error || 'Could not open stream');
+      const hlsUrl = res.data?.subHls || res.data?.hls;
+      if (!hlsUrl) throw new Error('No HLS URL returned');
       attachHls(hlsUrl);
     } catch (e) {
-      // Some devices/accounts cannot provide HD consistently; fallback to SD.
-      if (streamId === 0 && allowFallback) {
-        setStreamQuality(1);
-        startLivePreview(1, false);
-        return;
+      if (mountedRef.current) { setStreamError(e.message || 'Could not open stream'); setConnecting(false); }
+    }
+  }
+
+  // Poll snapshot every 5s when not streaming
+  // Server caches the Imou API call for 30s, so actual API usage stays low
+  async function fetchThumb() {
+    if (!mountedRef.current || streaming) return;
+    try {
+      const res = await get(`/devices/${device.deviceId}/snapshot`);
+      if (mountedRef.current && res.ok && res.data?.path) {
+        // Append ts as cache-buster so browser loads the new JPEG even if path is same
+        setThumbUrl(`${res.data.path}?t=${Math.floor(res.data.ts || Date.now() / 1000)}`);
+        setThumbTs(res.data.ts ? new Date(res.data.ts * 1000) : new Date());
       }
-      setStreamError(e.message || 'Could not open stream');
-      setConnecting(false);
+    } catch (_) {}
+    if (mountedRef.current && !streaming) {
+      thumbTimer.current = setTimeout(fetchThumb, THUMB_INTERVAL);
     }
   }
 
   useEffect(() => {
-    try {
-      localStorage.setItem(`imou-card-quality:${device.deviceId}`, String(streamQuality));
-    } catch (_) {
-      // Ignore storage errors in private mode.
-    }
-
-    startLivePreview(streamQuality);
+    mountedRef.current = true;
+    fetchThumb(); // initial fetch immediately
     return () => {
+      mountedRef.current = false;
+      clearTimeout(thumbTimer.current);
       teardownPlayer();
       post(`/devices/${device.deviceId}/stream/unbind`, { channel: '0' }).catch(() => {});
     };
-  }, [device.deviceId, streamQuality]);
+  }, [device.deviceId]);
 
-  const isPTZ = hasAbility(device, 'PT') || hasAbility(device, 'PTZ');
+  // Stop polling when streaming starts, resume when it stops
+  useEffect(() => {
+    clearTimeout(thumbTimer.current);
+    if (!streaming) fetchThumb();
+  }, [streaming]);
 
   return (
     <div className={`camera-card${selected ? ' selected' : ''}`} onClick={() => onSelect(device)}>
-      {/* Video area */}
+      {/* Video / thumbnail area */}
       <div className="camera-view">
-        {!streamError ? (
-          <video
-            ref={videoRef}
-            muted
-            autoPlay
-            playsInline
-            controls={false}
-            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-          />
+        {streaming ? (
+          <>
+            {!streamError ? (
+              <video ref={videoRef} muted autoPlay playsInline controls={false}
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+            ) : (
+              <div className="no-signal">
+                <div className="no-signal-icon">📷</div>
+                <div style={{ fontSize: 12 }}>{streamError}</div>
+                <button className="btn btn-sm" style={{ marginTop: 8 }}
+                  onClick={e => { e.stopPropagation(); startStream(); }}>↻ Retry</button>
+              </div>
+            )}
+            {!streamError && !connecting && <div className="live-badge">LIVE</div>}
+            {connecting && (
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.5)' }}>
+                <div className="spinner" />
+              </div>
+            )}
+            {/* Stop button on hover */}
+            <div className="camera-overlay">
+              <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                onClick={e => { e.stopPropagation(); stopStream(); }}>■ Stop</button>
+              <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                onClick={e => { e.stopPropagation(); onStream(device); }}>⛶ Fullscreen</button>
+              {isPTZ && (
+                <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                  onClick={e => { e.stopPropagation(); onPTZ(device); }}>🕹 PTZ</button>
+              )}
+            </div>
+          </>
         ) : (
-          <div className="no-signal">
-            <div className="no-signal-icon">📷</div>
-            <div>{streamError}</div>
-          </div>
+          /* Idle state — snapshot thumbnail with play overlay */
+          <>
+            {thumbUrl && (
+              <img src={thumbUrl}
+                alt="Camera preview"
+                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+            )}
+            {/* Play button overlay */}
+            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: thumbUrl ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.6)', cursor: 'pointer' }}
+              onClick={e => { e.stopPropagation(); startStream(); }}>
+              <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'rgba(0,0,0,0.55)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 22, color: '#fff', boxShadow: '0 2px 10px rgba(0,0,0,0.6)', userSelect: 'none' }}>▶</div>
+            </div>
+            {/* Snapshot timestamp */}
+            {thumbTs && (
+              <div style={{ position: 'absolute', bottom: 6, right: 8, fontSize: 10, color: 'rgba(255,255,255,0.75)',
+                background: 'rgba(0,0,0,0.5)', borderRadius: 3, padding: '1px 5px', pointerEvents: 'none' }}>
+                {thumbTs.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </div>
+            )}
+            {/* Hover overlay */}
+            <div className="camera-overlay">
+              <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                onClick={e => { e.stopPropagation(); startStream(); }}>▶ Live</button>
+              <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                onClick={e => { e.stopPropagation(); onStream(device); }}>⛶ Fullscreen</button>
+              {isPTZ && (
+                <button className="btn btn-sm" style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
+                  onClick={e => { e.stopPropagation(); onPTZ(device); }}>🕹 PTZ</button>
+              )}
+            </div>
+          </>
         )}
-
-        {/* Overlays */}
-        {!streamError && !connecting && (
-          <div className="live-badge">LIVE</div>
-        )}
-
-        <div className="camera-timestamp">
-          {connecting ? 'Connecting…' : `Live ${streamQuality === 1 ? 'SD' : 'HD'}`}
-        </div>
-
-        {/* Action overlay on hover */}
-        <div className="camera-overlay">
-          <button
-            className="btn btn-sm"
-            style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
-            onClick={e => { e.stopPropagation(); onStream(device); }}
-          >
-            ▶ Stream
-          </button>
-          {isPTZ && (
-            <button
-              className="btn btn-sm"
-              style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
-              onClick={e => { e.stopPropagation(); onPTZ(device); }}
-            >
-              🕹 PTZ
-            </button>
-          )}
-          <button
-            className="btn btn-sm"
-            style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
-            onClick={e => { e.stopPropagation(); setStreamQuality(q => q === 1 ? 0 : 1); }}
-          >
-            {streamQuality === 1 ? 'HD' : 'SD'}
-          </button>
-          <button
-            className="btn btn-sm"
-            style={{ background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none' }}
-            onClick={e => { e.stopPropagation(); startLivePreview(); }}
-          >
-            ↻ Reconnect
-          </button>
-        </div>
       </div>
 
       {/* Camera info */}
@@ -1049,12 +1091,8 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
             <div className={`status-indicator status-${device.status === 'online' ? 'online' : 'offline'}`} />
             {device.name}
           </div>
-          <button
-            className="icon-btn"
-            style={{ width: 28, height: 28, fontSize: 13 }}
-            onClick={e => { e.stopPropagation(); onCameraSettings(device); }}
-            title="Camera settings"
-          >
+          <button className="icon-btn" style={{ width: 28, height: 28, fontSize: 13 }}
+            onClick={e => { e.stopPropagation(); onCameraSettings(device); }} title="Camera settings">
             ⚙️
           </button>
         </div>
@@ -1066,20 +1104,15 @@ function CameraCard({ device, settings, onSelect, selected, onPTZ, onStream, onC
         </div>
 
         <div className="camera-actions">
-          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); onStream(device); }}>
-            ▶ Live
-          </button>
-          {isPTZ && (
-            <button className="btn btn-sm" onClick={e => { e.stopPropagation(); onPTZ(device); }}>
-              🕹 Control
-            </button>
+          {streaming ? (
+            <button className="btn btn-sm" onClick={e => { e.stopPropagation(); stopStream(); }}>■ Stop</button>
+          ) : (
+            <button className="btn btn-sm" onClick={e => { e.stopPropagation(); startStream(); }}>▶ Live</button>
           )}
-          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); setStreamQuality(q => q === 1 ? 0 : 1); }}>
-            {streamQuality === 1 ? 'HD' : 'SD'}
-          </button>
-          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); startLivePreview(); }}>
-            ↻ Reconnect
-          </button>
+          <button className="btn btn-sm" onClick={e => { e.stopPropagation(); onStream(device); }}>⛶ Fullscreen</button>
+          {isPTZ && (
+            <button className="btn btn-sm" onClick={e => { e.stopPropagation(); onPTZ(device); }}>🕹 Control</button>
+          )}
         </div>
       </div>
     </div>
@@ -1223,6 +1256,12 @@ function App() {
           } else if (msg.type === 'devices_updated') {
             // Re-fetch devices when server signals update
             get('/devices').then(r => r.ok && setDevices(r.data || []));
+          } else if (msg.type === 'device_status') {
+            // Camera came online or went offline — update just that device's status dot
+            const { device_id, status } = msg.data;
+            setDevices(prev => prev.map(d =>
+              d.deviceId === device_id ? { ...d, status } : d
+            ));
           }
         } catch (err) {
           console.error('SSE parse error', err);

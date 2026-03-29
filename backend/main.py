@@ -44,49 +44,100 @@ import api.app as flask_app_module
 os.makedirs(config.ALARM_IMG_DIR, exist_ok=True)
 
 
-def cache_alarm_snapshot(alarm_id: str, api_client, device_id: str, channel_id: str = "0") -> str:
+def _dav_to_jpeg(dav_data: bytes, dest: str) -> bool:
     """
-    Take a real-time JPEG snapshot via setDeviceSnapEnhanced and cache it locally.
+    Extract the first video frame from a DHAV .dav file as JPEG using ffmpeg.
+    Returns True on success. ffmpeg must be installed.
+    """
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix=".dav", delete=False) as tf:
+        tf.write(dav_data)
+        tmp_dav = tf.name
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_dav, "-frames:v", "1", "-q:v", "2", dest],
+            capture_output=True, timeout=20
+        )
+        if result.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 100:
+            # Verify it's a JPEG
+            with open(dest, "rb") as f:
+                return f.read(2) == b"\xff\xd8"
+        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.unlink(tmp_dav)
+        except OSError:
+            pass
+
+
+def cache_alarm_snapshot(alarm_id: str, api_client, device_id: str, channel_id: str = "0", dav_url: str = "") -> str:
+    """
+    Save the event JPEG for an alarm and return its local path.
     Returns '/api/alarm-image/<alarm_id>' on success, or '' on failure.
-    Imou thumbUrl files are DHAV (proprietary encrypted format), not JPEG —
-    so we ignore them and take a fresh snapshot instead.
+
+    Strategy (in order):
+    1. dav_url — download Imou's .dav (DHAV) thumbnail and extract the first frame with ffmpeg.
+       This gives the EXACT event moment, same as the IMOU app.
+    2. Live snapshot via setDeviceSnapEnhanced — captures the current camera frame.
+       Only useful from the webhook path where the camera is still recording the event.
     """
     if not alarm_id:
         return ""
     dest = os.path.join(config.ALARM_IMG_DIR, f"{alarm_id}.jpg")
     if os.path.exists(dest):
-        # Verify it's actually a JPEG (not a stale DHAV file)
         with open(dest, "rb") as f:
-            header = f.read(4)
-        if header[:2] == b"\xff\xd8":
+            header = f.read(2)
+        if header == b"\xff\xd8":
             return f"/api/alarm-image/{alarm_id}"
-        # It's a DHAV file — delete it and re-fetch
-        os.remove(dest)
+        os.remove(dest)  # stale non-JPEG file
+
+    # 1. Decode the DHAV thumbnail — exact event image, same as IMOU app
+    if dav_url:
+        try:
+            r = requests.get(dav_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            if r.content[:4] == b"DHAV" or r.content[:4] == b"dhav":
+                if _dav_to_jpeg(r.content, dest):
+                    logger.debug("Alarm image decoded from .dav for %s", alarm_id)
+                    return f"/api/alarm-image/{alarm_id}"
+                else:
+                    logger.debug("ffmpeg failed to decode .dav for %s", alarm_id)
+            elif r.content[:2] == b"\xff\xd8":
+                # Occasionally Imou serves a raw JPEG despite the .dav extension
+                with open(dest, "wb") as f:
+                    f.write(r.content)
+                return f"/api/alarm-image/{alarm_id}"
+        except Exception as e:
+            logger.debug("dav_url download failed for %s: %s", alarm_id, e)
+
+    # 2. Fall back: live snapshot (useful from webhook path — camera still recording the event)
     try:
         import time as _time
         result = api_client.get_snapshot(device_id, channel_id)
         snap_url = result.get("url", "")
         if not snap_url:
             return ""
-        # Imou returns the URL before the camera uploads the JPEG to CDN.
-        # Retry up to 4 times with exponential backoff (1s, 2s, 4s, 8s).
-        for attempt in range(4):
-            _time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+        # Imou returns the CDN URL before the camera uploads the JPEG.
+        # Try immediately first, then back off (0s, 2s, 5s, 10s).
+        for delay in (0, 2, 5, 10):
+            _time.sleep(delay)
             try:
                 r = requests.get(snap_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
                 r.raise_for_status()
                 if r.content[:2] == b"\xff\xd8":
-                    # Valid JPEG — save and return
                     with open(dest, "wb") as f:
                         f.write(r.content)
+                    logger.debug("Alarm image saved from live snapshot for %s", alarm_id)
                     return f"/api/alarm-image/{alarm_id}"
-                logger.debug("Snapshot attempt %d for %s: not JPEG yet (%s)", attempt + 1, alarm_id, r.content[:4])
+                logger.debug("Snapshot download for %s: not JPEG yet (delay=%ds)", alarm_id, delay)
             except Exception as dl_err:
-                logger.debug("Snapshot attempt %d for %s failed: %s", attempt + 1, alarm_id, dl_err)
-        logger.warning("Snapshot for alarm %s never became a valid JPEG after 4 attempts", alarm_id)
+                logger.debug("Snapshot download for %s failed (delay=%ds): %s", alarm_id, delay, dl_err)
+        logger.warning("Snapshot for alarm %s never became a valid JPEG after retries", alarm_id)
         return ""
     except Exception as e:
-        logger.warning("Failed to snapshot alarm image %s (%s): %s", alarm_id, device_id, e)
+        logger.warning("Failed to get alarm image %s (%s): %s", alarm_id, device_id, e)
         return ""
 
 
@@ -166,7 +217,9 @@ def poll_alarms(api_client: ImouAPI):
                 alarm_id   = str(alarm.get("alarmId", ""))
                 event_type = ALARM_TYPE_MAP.get(str(alarm.get("type", "")), f"Alarm_{alarm.get('type')}")
                 alarm_time = alarm.get("localDate") or str(alarm.get("time", ""))
-                raw_url    = alarm.get("thumbUrl") or alarm.get("picUrl") or ""
+                # thumbUrl / picurlArray are .dav (DHAV) files — ffmpeg decodes them to JPEG.
+                # This gives the exact event frame, the same image the IMOU app shows.
+                dav_url = alarm.get("thumbUrl") or (alarm.get("picurlArray") or [""])[0] or ""
                 dev_name   = alarm.get("name") or device.get("name") or device_id
 
                 # First save without image so we record the alarm immediately
@@ -176,8 +229,8 @@ def poll_alarms(api_client: ImouAPI):
                 )
                 if is_new:
                     new_count += 1
-                    # Broadcast immediately with no image; fetch snapshot in background
-                    # so we don't block the 60s poll loop (snapshot download can take ~15s)
+                    # Broadcast immediately with no image; fetch event image in background
+                    # so we don't block the 60s poll loop
                     flask_app_module.broadcast_event("notification", {
                         "id":          row_id,
                         "device_id":   device_id,
@@ -189,13 +242,13 @@ def poll_alarms(api_client: ImouAPI):
                         "is_read":     False,
                         "created_at":  datetime.utcnow().isoformat() + "Z",
                     })
-                    # Fetch JPEG snapshot in a separate thread so it doesn't block polling
-                    def _fetch_img(rid, aid, did):
-                        img = cache_alarm_snapshot(aid, api_client, did, "0")
+                    # Decode the .dav thumbnail to JPEG in a background thread
+                    def _fetch_img(rid, aid, did, durl):
+                        img = cache_alarm_snapshot(aid, api_client, did, "0", dav_url=durl)
                         if img:
                             _db.update_notification_image(rid, img)
                     threading.Thread(
-                        target=_fetch_img, args=(row_id, alarm_id, device_id), daemon=True
+                        target=_fetch_img, args=(row_id, alarm_id, device_id, dav_url), daemon=True
                     ).start()
 
         except Exception as e:
@@ -315,7 +368,7 @@ def create_app():
                     for alarm in result.get("alarms", []):
                         alarm_id   = str(alarm.get("alarmId", ""))
                         event_type = ALARM_TYPE_MAP.get(str(alarm.get("type", "")), f"Alarm_{alarm.get('type')}")
-                        # Don't store thumbUrl — it's DHAV format, not JPEG
+                        dav_url = alarm.get("thumbUrl") or (alarm.get("picurlArray") or [""])[0] or ""
                         _, is_new  = _db.save_notification(
                             device["device_id"], alarm.get("name") or device["name"],
                             "0", event_type,
@@ -325,23 +378,57 @@ def create_app():
                         )
                         if is_new:
                             new_total += 1
+                            # Decode .dav thumbnail to JPEG in background
+                            def _bf_img(aid, did, durl):
+                                img = cache_alarm_snapshot(aid, api_client, did, "0", dav_url=durl)
+                                if img:
+                                    conn = _db.get_connection()
+                                    try:
+                                        row = conn.execute("SELECT id FROM notifications WHERE alarm_id=?", (aid,)).fetchone()
+                                        if row:
+                                            _db.update_notification_image(row["id"], img)
+                                    finally:
+                                        conn.close()
+                            threading.Thread(target=_bf_img, args=(alarm_id, device["device_id"], dav_url), daemon=True).start()
                 except Exception as e:
                     logger.warning("Startup alarm backfill failed for %s: %s", device["device_id"], e)
             logger.info("Startup alarm backfill: %d alerts loaded from last 24h", new_total)
 
-        # Backfill missing snapshots for recent alerts already in DB.
-        # This populates image_url for alerts that were saved without JPEGs.
+        # Backfill images for notifications already in DB that have alarm_id but no image.
+        # Re-query getAlarmMessage to get the .dav URL for ffmpeg decoding.
         missing = _db.get_notifications_missing_images(limit=60, max_age_hours=24)
-        fixed = 0
-        for n in missing:
-            try:
-                img = cache_alarm_snapshot(str(n["alarm_id"]), api_client, n["device_id"], "0")
-                if img:
-                    _db.update_notification_image(int(n["id"]), img)
-                    fixed += 1
-            except Exception as e:
-                logger.debug("Startup image backfill failed for notification %s: %s", n.get("id"), e)
         if missing:
+            # Group by device_id and query alarm history to get dav_url for each
+            import pytz as _pytz
+            _lv2 = _pytz.timezone("Europe/Riga")
+            _now2 = datetime.now(_lv2)
+            _begin2 = (_now2 - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            _end2   = _now2.strftime("%Y-%m-%d %H:%M:%S")
+            # Build alarm_id → dav_url map from cloud
+            _dav_map = {}
+            for _dev in {n["device_id"] for n in missing}:
+                try:
+                    _res = api_client._post_auth("getAlarmMessage", {
+                        "deviceId": _dev, "channelId": "0",
+                        "beginTime": _begin2, "endTime": _end2, "limit": 50,
+                    })
+                    for _a in _res.get("alarms", []):
+                        _aid = str(_a.get("alarmId", ""))
+                        _durl = _a.get("thumbUrl") or (_a.get("picurlArray") or [""])[0] or ""
+                        if _aid and _durl:
+                            _dav_map[_aid] = _durl
+                except Exception:
+                    pass
+            fixed = 0
+            for n in missing:
+                try:
+                    dav = _dav_map.get(str(n.get("alarm_id", "")), "")
+                    img = cache_alarm_snapshot(str(n["alarm_id"]), api_client, n["device_id"], "0", dav_url=dav)
+                    if img:
+                        _db.update_notification_image(int(n["id"]), img)
+                        fixed += 1
+                except Exception as e:
+                    logger.debug("Startup image backfill failed for notification %s: %s", n.get("id"), e)
             logger.info("Startup image backfill: %d/%d alerts updated", fixed, len(missing))
 
     threading.Thread(target=delayed_startup, daemon=True).start()
